@@ -1,0 +1,28 @@
+---
+- name: Create test file on master
+  hosts: master
+
+  tasks:
+  - name: Write "NFS is working" into file 'nfstest' within the shared folder
+    command: sudo bash -c 'echo "NFS is working" >> /nfsshare/horovod/nfstest'
+
+  - name: Wait 30 seconds for file copy
+    pause:
+      seconds: 30
+
+- name: Check test file on workers
+  hosts: workers
+
+  tasks:
+    - name: Read file 'nfstest' within the shared folder
+      command: docker exec -it horovod_worker bash -c "cat /horovod/nfstest"
+      register: out
+
+    - debug: var=out.stdout_lines
+
+- name: Remove test file on master
+  hosts: master
+
+  tasks:
+    - name: Delete file 'nfstest' within the shared folder
+      command: sudo bash -c 'rm /nfsshare/horovod/nfstest'

@@ -1,0 +1,183 @@
+# yamllint disable-file
+
+#Define the default Docker image to be used for job execution, and its entrypoint
+image:
+  name: porakrisz/terraform-ansible-runner:latest
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'  
+
+#Define the variables. Those appended with a description also show up on the manual trigger page
+variables:
+  PROCESS:
+    value: 1
+    description: "The number of processes per node"
+  WORKER:
+    value: 1
+    description: "The number of worker nodes"
+  OPENSTACK_WORKER: 1
+  AWS_WORKER: 1
+
+#Define the stages of the pipeline
+stages:
+  - validate
+  - build
+  - test
+  - destroy
+
+#The before script is executed at the start of each job. It copies sensitive information into Terraform files, sets up SSH and permissions.
+before_script:
+  - sed -i "s/username/$OPENSTACK_USERNAME/g" terraform_openstack/auth_data.auto.tfvars
+  - sed -i "s/userpassword/$OPENSTACK_PASSWORD/g" terraform_openstack/auth_data.auto.tfvars
+  - sed -i "s%authurl%$OPENSTACK_AUTH_URL%g" terraform_openstack/resources.auto.tfvars
+  - sed -i "s/floatingip/$OPENSTACK_FLOATING_IP/g" terraform_openstack/resources.auto.tfvars
+  - sed -i "s/accesskey/$AWS_ACCESS_KEY_ID/g" terraform_aws/auth_data.auto.tfvars
+  - sed -i "s/secretkey/$AWS_SECRET_ACCESS_KEY/g" terraform_aws/auth_data.auto.tfvars
+  - eval $(ssh-agent -s)
+  - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+  - mkdir -p ~/.ssh
+  - chmod 700 ~/.ssh
+  - chmod -R +x scripts 
+
+#A template job which contains configuration for limiting pipeline runs to occus when the listed files changed. Jobs inherit this with "<<: *pipeline_limiter"
+.job_template: &pipeline_limiter
+  rules:
+    - changes:
+        - "**/*.{tf}"
+        - "**/*.{tfvars}"
+        - "**/*.{hcl}"
+        - "**/*.{sh}"
+        - "**/*.{yaml}"
+        - "**/*.{yml}"
+
+#yamllint job, uses the yamllint image and validates all yaml files. before_script is overwritten since it is unnecessary.
+yamllint:
+  image: sdesbure/yamllint
+  stage: validate
+  before_script: []
+  script:
+    - yamllint .
+
+#tflint job, uses the tflint image and validates all terraform files. before_script is overwritten since it is unnecessary.
+tflint:
+  stage: validate
+  before_script: []
+  image:
+    name: wata727/tflint
+    entrypoint: ["/bin/sh", "-c"]
+  script:
+    - cd terraform_openstack
+    - tflint .
+    - cd ../terraform_aws
+    - tflint .
+
+#OpenStack build job: variables and terraform backend is set up with scripts, terraform is initialized, infrastructure is built based on openstack descriptors,
+#artifacts are generated using a script, which also get uploaded from the path specified under 'artifacts:paths'. This job needs yamllint and tflint to succeed.
+openstack:build:
+  <<: *pipeline_limiter
+  stage: build
+  script:
+    - cd terraform_openstack
+    - . ../scripts/get-worker-count.sh OPENSTACK_WORKER
+    - . ../scripts/backend-config.sh $TERRAFORM_STATE_ADDRESS openstack-terraform-state $GITLAB_ACCESS_TOKEN
+    - terraform --version
+    - terraform init -plugin-dir=/usr/bin/ -reconfigure
+    - terraform apply -auto-approve
+    - terraform init -plugin-dir=/usr/bin/ -reconfigure
+    - . ../scripts/create-artifacts.sh openstack $PROCESS
+  artifacts:
+    paths:
+      - ./openstack:inventory
+      - ./openstack:hostlist
+  needs: ["yamllint", "tflint"]
+
+#OpenStack test job: Public ip of master node is added to known hosts, and ansible is configured by a script to allow master node to act as a proxy during test execution.
+#Variables are set up with a script, the Ansible community.docker module is installed, then tests are executed. The last playbook is put into debug mode in order to
+#format the output. It also requires additional arguments, such as the hostlist artifact's contents and the summarized process count, which is calculated from variables.
+#Failure is allowed for the test job, since infrastructure should be destroyed even if tests fail. Needs openstack:build to succeed.
+openstack:test:
+  <<: *pipeline_limiter
+  stage: test
+  script:
+    - cd terraform_openstack
+    - ssh-keyscan -H $OPENSTACK_FLOATING_IP >> ~/.ssh/known_hosts
+    - . ../scripts/ansible-config.sh $OPENSTACK_FLOATING_IP
+    - . ../scripts/get-worker-count.sh OPENSTACK_WORKER
+    - ansible-galaxy collection install community.docker
+    - ansible-playbook -u ubuntu -i ../openstack:inventory ../tests/container_test.yml
+    - ansible-playbook -u ubuntu -i ../openstack:inventory ../tests/nfs_test.yml
+    - echo Testing Jupyter interface availability...
+    - curl -L $OPENSTACK_FLOATING_IP:8888 | grep '<title>'
+    - ANSIBLE_STDOUT_CALLBACK=debug ansible-playbook -u ubuntu -i ../openstack:inventory ../tests/horovod_test.yml --extra-vars "hostList=$(cat ../openstack:hostlist) allProcess=$((($OPENSTACK_WORKER+1)*($PROCESS)))"
+  allow_failure: true
+  needs: ["openstack:build"]
+
+#OpenStack destroy job: variables and terraform backend is set up with scripts, terraform is initialized, infrastructure is destroyed.
+openstack:destroy:
+  <<: *pipeline_limiter
+  stage: destroy
+  script:
+    - cd terraform_openstack
+    - . ../scripts/get-worker-count.sh OPENSTACK_WORKER
+    - . ../scripts/backend-config.sh $TERRAFORM_STATE_ADDRESS openstack-terraform-state $GITLAB_ACCESS_TOKEN
+    - terraform --version
+    - terraform init -plugin-dir=/usr/bin/ -reconfigure
+    - terraform destroy -auto-approve
+  needs: ["openstack:test"]
+
+#AWS build job: variables and terraform backend is set up with scripts, terraform is initialized, infrastructure is built based on openstack descriptors,
+#artifacts are generated using a script, which also get uploaded from the path specified under 'artifacts:paths'. This job needs yamllint and tflint to succeed.
+aws:build:
+  <<: *pipeline_limiter
+  stage: build
+  script: 
+    - cd terraform_aws
+    - . ../scripts/get-worker-count.sh AWS_WORKER
+    - . ../scripts/backend-config.sh $TERRAFORM_STATE_ADDRESS aws-terraform-state $GITLAB_ACCESS_TOKEN
+    - terraform --version
+    - terraform init -plugin-dir=/usr/bin/ -reconfigure
+    - terraform apply -auto-approve
+    - terraform init -plugin-dir=/usr/bin/ -reconfigure
+    - . ../scripts/create-artifacts.sh aws $PROCESS
+  artifacts:
+    paths:
+      - ./aws:inventory
+      - ./aws:hostlist
+  needs: ["yamllint", "tflint"]
+
+#AWS test job: Since Public ip of master node is not hardcoded, Terraform and the remote backend have to be initialized in order to get it. The IP is then added 
+#to known hosts, and ansible is configured by a script to allow master node to act as a proxy during test execution.
+#Variables are set up with a script, the Ansible community.docker module is installed, then tests are executed. The last playbook is put into debug mode in order to
+#format the output. It also requires additional arguments, such as the hostlist artifact's contents and the summarized process count, which is calculated from variables.
+#Failure is allowed for the test job, since infrastructure should be destroyed even if tests fail. Needs aws:build to succeed.
+aws:test:
+  <<: *pipeline_limiter
+  stage: test
+  script: 
+    - cd terraform_aws
+    - . ../scripts/backend-config.sh $TERRAFORM_STATE_ADDRESS aws-terraform-state $GITLAB_ACCESS_TOKEN
+    - terraform init -plugin-dir=/usr/bin/ -reconfigure
+    - ssh-keyscan -H $(terraform output -raw master_instance_public_ip) >> ~/.ssh/known_hosts
+    - . ../scripts/ansible-config.sh $(terraform output -raw master_instance_public_ip)
+    - . ../scripts/get-worker-count.sh AWS_WORKER
+    - ansible-galaxy collection install community.docker
+    - ansible-playbook -u ubuntu -i ../aws:inventory ../tests/container_test.yml
+    - ansible-playbook -u ubuntu -i ../aws:inventory ../tests/nfs_test.yml
+    - echo Testing Jupyter interface availability...
+    - curl -L $(terraform output -raw master_instance_public_ip):8888 | grep '<title>'
+    - ANSIBLE_STDOUT_CALLBACK=debug ansible-playbook -u ubuntu -i ../aws:inventory ../tests/horovod_test.yml --extra-vars "hostList=$(cat ../aws:hostlist) allProcess=$((($AWS_WORKER+1)*($PROCESS)))"
+  allow_failure: true
+  needs: ["aws:build"]
+
+#AWS destroy job: variables and terraform backend is set up with scripts, terraform is initialized, infrastructure is destroyed.
+aws:destroy:
+  <<: *pipeline_limiter
+  stage: destroy
+  script:
+    - cd terraform_aws
+    - . ../scripts/get-worker-count.sh AWS_WORKER
+    - . ../scripts/backend-config.sh $TERRAFORM_STATE_ADDRESS aws-terraform-state $GITLAB_ACCESS_TOKEN
+    - terraform --version
+    - terraform init -plugin-dir=/usr/bin/ -reconfigure
+    - terraform destroy -auto-approve
+  needs: ["aws:test"]

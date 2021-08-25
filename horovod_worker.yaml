@@ -1,0 +1,8 @@
+---
+- name: Create Horovod workers
+  hosts: all
+  remote_user: ubuntu
+  become: yes
+  roles:
+    - docker
+    - horovod_worker

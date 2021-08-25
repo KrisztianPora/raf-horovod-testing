@@ -1,0 +1,21 @@
+---
+- name: Horovod Worker Init
+  hosts: workers
+
+  # Step numbers are changed in order to make the training complete under a reasonable amount of time.
+  tasks:
+  - name: Change worker step number
+    command: docker exec -it horovod_worker bash -c "sed -i 's/10000/200/g' /examples/tensorflow2_mnist.py"
+
+- name: Horovod Test Run
+  hosts: master
+
+  tasks:
+  - name: Change master step number
+    command: docker exec -it horovod_master bash -c "sed -i 's/10000/200/g' /examples/tensorflow2_mnist.py"
+
+  - name: Execute commands in docker container
+    command: docker exec -it horovod_master bash -c "horovodrun -np {{ allProcess }} -H {{ hostList }} -p 12345 python /examples/tensorflow2_mnist.py"
+    register: out
+
+  - debug: var=out.stdout_lines

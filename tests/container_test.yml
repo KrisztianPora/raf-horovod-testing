@@ -1,0 +1,57 @@
+---
+- name: Setup permissions for Docker
+  hosts: all
+
+  tasks:
+  - name: Add user to Docker group
+    command: sudo bash -c 'usermod -aG docker $USER'
+
+- name: Master Container Test
+  hosts: master
+
+  tasks:
+  - name: Get horovod_master Container Info
+    community.docker.docker_container_info:
+      name: horovod_master
+    register: horovodmasterresult
+
+  - name: Does container exist?
+    debug:
+      msg: "The container {{ horovodmasterresult.container['Name'] }} {{ 'exists' if horovodmasterresult.exists else 'does not exist' }}"
+
+  - name: Print the status of the container
+    debug:
+      msg: "The container {{ horovodmasterresult.container['Name'] }} is {{ horovodmasterresult.container['State']['Status'] }}"
+    when: horovodmasterresult.exists
+
+  - name: Get nfs Container Info
+    community.docker.docker_container_info:
+      name: nfs
+    register: nfsresult
+
+  - name: Does container exist?
+    debug:
+      msg: "The container {{ nfsresult.container['Name'] }} {{ 'exists' if nfsresult.exists else 'does not exist' }}"
+
+  - name: Print the status of the container
+    debug:
+      msg: "The container {{ nfsresult.container['Name'] }} is {{ nfsresult.container['State']['Status'] }}"
+    when: nfsresult.exists
+
+- name: Worker Container Test
+  hosts: workers
+
+  tasks:
+    - name: Get horovod_worker Container Info
+      community.docker.docker_container_info:
+        name: horovod_worker
+      register: horovodworkerresult
+
+    - name: Does container exist?
+      debug:
+        msg: "The container {{ horovodworkerresult.container['Name'] }} {{ 'exists' if horovodworkerresult.exists else 'does not exist' }}"
+
+    - name: Print the status of the container
+      debug:
+        msg: "The container {{ horovodworkerresult.container['Name'] }} is {{ horovodworkerresult.container['State']['Status'] }}"
+      when: horovodworkerresult.exists

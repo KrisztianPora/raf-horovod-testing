@@ -1,0 +1,8 @@
+---
+- name: Create Horovod master
+  hosts: all
+  remote_user: ubuntu
+  become: yes
+  roles:
+    - docker
+    - horovod_master
